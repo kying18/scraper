@@ -1,24 +1,27 @@
 import urllib.request
 from lxml import html
-import pickle
+import pymysql
 import smtplib
 
 from email.message import EmailMessage
 
 import config
+from library.database import query, prevent_sql_injection, close_connection
 
 class FacebookScraper(object):
     """
     Object to scrape posts from a Facebook page.
     """
-    def __init__(self, page_ids):
+    def __init__(self, page_ids, connection):
         """
         Initializes Facebook Scraper object
         :param page_ids: strings of page IDs to scrape from as an iterable
             These are the end of the URL that links to the Facebook page, ie:
                 www.facebook.com/scraper/ --> page ID is 'scraper'
+        :param connection: pymysql connection object
         """
         self.page_ids = page_ids
+        self.connection = connection
 
     def _get_profile_html(self, page_id):
         """
@@ -31,31 +34,10 @@ class FacebookScraper(object):
             f.write(profile)
         return profile
 
-    def _get_previous_posts(self, pickle_file):
-        """
-        Gets the previous posts existing
-        :param pickle_file: path to pickle file consisting of previously scraped posts
-        :return: previously saved posts
-        """
-        with open(pickle_file, 'rb') as p:
-            posts = pickle.load(p)
-        return posts
-
-    def _save_posts(self, pickle_file, posts):
-        """
-        Saves posts to pickle file
-        :param pickle_file: path to pickle file consisting of previously scraped posts
-        :param posts: posts to save to pickle file
-        :return: None
-        """
-        with open(pickle_file, 'wb') as p:
-            pickle.dump(posts, p)
-
-    def _scrape_profile(self, page_id, posts):
+    def _scrape_profile(self, page_id):
         """
         Gets the new posts from a Facebook profile
         :param page_id: string, page ID of profile
-        :param posts: previous posts
         :return: list of new posts
         """
         new_posts = []
@@ -73,40 +55,35 @@ class FacebookScraper(object):
             for line in lines:
                 text += line.xpath("string(.)") + '\n'
 
-            # if not already posts, add to set
-            if (text, page_id) not in posts:
-                new_posts.append((text, page_id))
-
-        # save new posts
-        self._save_posts(config.POSTS_PATH, (set(new_posts) | posts))
+            new_posts.append(text)
 
         return new_posts
 
     def get_new_posts(self):
         """
-        Returns a list of new posts
-        :return: list of new posts
+        Gets the new posts from the pages if not in the database
+        :return: None
         """
         new_posts = []
 
         # for each profile
         for page_id in self.page_ids:
-            previous_posts = self._get_previous_posts(config.POSTS_PATH)
-
             # get new posts
-            for post, _ in self._scrape_profile(page_id, previous_posts):
+            for post in self._scrape_profile(page_id):
                 if len(new_posts) == 0 or post != new_posts[-1]:
-                    new_posts.append(post)
-                    print(post)
+                    post = prevent_sql_injection(post)
+                    sql = "CALL sys.InsertPost('{post}', '{page}');".format(post=post, page=page_id)
+                    query(self.connection, sql, results=False)
 
-        return new_posts
-
-    def email_posts(self, posts):
+    def email_posts(self):
         """
         Email posts to specified recipients
-        :param posts: list of posts to email
         :return: None
         """
+        sql = 'SELECT id, post_text FROM sys.FacebookPosts WHERE notified=0;'
+        db_results = query(self.connection, sql, commit=False)
+        posts = [result['post_text'] for result in db_results]
+
         if not posts:
             return
 
@@ -127,21 +104,28 @@ class FacebookScraper(object):
         s.starttls()
         s.login(config.EMAIL, config.PWORD)
         s.send_message(msg)
-        # s.send_message(msg)
         s.quit()
+
+        notified_ids = [str(result['id']) for result in db_results]
+        sql = 'UPDATE sys.FacebookPosts SET notified=1 ' \
+              'WHERE id IN ({ids});'.format(ids=','.join(notified_ids))
+        query(self.connection, sql, commit=True)
 
     def scrape(self):
         """
         Scrapes and emails posts
         :return: None
         """
-        new_posts = self.get_new_posts()
-        self.email_posts(new_posts)
-
+        self.get_new_posts()
+        self.email_posts()
+        close_connection(self.connection)
 
 if __name__ == '__main__':
-    if config.RESET_SAVED_POSTS:
-        with open(config.POSTS_PATH, 'wb') as p:
-            pickle.dump(set(), p)
-    scraper = FacebookScraper([config.TIMELY_CONFESSIONS, config.CONFESSIONS])
+    connection = pymysql.connect(host='localhost',
+                           user=config.DB_USER,
+                           password=config.DB_PASS,
+                           db='sys',
+                           charset='utf8mb4',
+                           cursorclass=pymysql.cursors.DictCursor)
+    scraper = FacebookScraper([config.TIMELY_CONFESSIONS, config.CONFESSIONS], connection)
     scraper.scrape()
